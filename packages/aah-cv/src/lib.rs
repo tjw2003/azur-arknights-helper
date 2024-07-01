@@ -15,12 +15,12 @@ pub mod utils;
 
 use image::{ImageBuffer, Luma};
 use imageproc::template_matching::Extremes;
-use template_matching::square_sum_arr2;
 use std::{
     borrow::Cow,
     mem::size_of,
-    ops::{Add, Mul},
+    ops::{Add, Div, Mul, Sub},
 };
+use template_matching::square_sum_arr2;
 use utils::{image_mean, square_sum};
 use wgpu::util::DeviceExt;
 
@@ -49,9 +49,7 @@ pub fn match_template<'a>(
 ) -> Image<'static> {
     match method {
         MatchTemplateMethod::CCOEFF => ccoeff(input, template, false),
-        MatchTemplateMethod::CCOEFF_NORMED => {
-            ccoeff(input, template, true)
-        },
+        MatchTemplateMethod::CCOEFF_NORMED => ccoeff(input, template, true),
         _ => {
             let mut matcher = TemplateMatcher::new();
             matcher.match_template(input.into(), template.into(), MatchTemplateMethod::CCOEFF);
@@ -63,31 +61,42 @@ pub fn match_template<'a>(
 pub fn ccoeff<'a>(
     input: &ImageBuffer<Luma<f32>, Vec<f32>>,
     template: &ImageBuffer<Luma<f32>, Vec<f32>>,
-    normed: bool
+    normed: bool,
 ) -> Image<'static> {
+    let mask = ImageBuffer::from_pixel(template.width(), template.height(), Luma([0.0f32]));
+
+    // let mut ic = input.clone();
+    let n = (template.width() * template.height()) as f32;
+    let i: Image = input.into();
+    let ic = i - ccorr(input, &mask) / n;
+
     let mut tc = template.clone();
     let mean_t = image_mean(&template);
     tc.enumerate_pixels_mut().for_each(|(_, _, pixel)| {
         pixel[0] -= mean_t;
     });
 
-    let mask = ImageBuffer::from_pixel(template.width(), template.height(), Luma([0.0f32]));
-    let ccorr_i_tc = ccorr(input.into(), (&tc).into());
-    let ccorr_i_m = ccorr(input.into(), (&mask).into());
+    // CCorr(I, T'*M)
+    let ccorr_i_tc = ccorr(input, &tc);
+    // CCorr(I, M)
+    let ccorr_i_m = ccorr(input, &mask);
     let mean_tc = image_mean(&tc);
 
-    let mut res = ccorr_i_tc + ccorr_i_m * (-mean_tc);
+    // CCorr(I', T') = CCorr(I, T'*M) - sum(T'*M)/sum(M)*CCorr(I, M)
+    let mut res = ccorr_i_tc + ccorr_i_m.clone() * (-mean_tc);
 
     if normed {
-        let norm_templ = square_sum(&template).sqrt();
-    }
+        let tc_sq_sum = square_sum(&tc);
 
-    res
+        res
+    } else {
+        res
+    }
 }
 
-pub fn ccorr<'a>(input: Image<'a>, template: Image<'a>) -> Image<'static> {
+pub fn ccorr<'a>(input: impl Into<Image<'a>>, template: impl Into<Image<'a>>) -> Image<'static> {
     let mut matcher = TemplateMatcher::new();
-    matcher.match_template(input, template, MatchTemplateMethod::CrossCorrelation);
+    matcher.match_template(input.into(), template.into(), MatchTemplateMethod::CrossCorrelation);
     matcher.wait_for_result().unwrap()
 }
 
@@ -167,10 +176,47 @@ pub fn find_extremes(input: &Image<'_>) -> Extremes<f32> {
     }
 }
 
+#[derive(Clone)]
 pub struct Image<'a> {
     pub data: Cow<'a, [f32]>,
     pub width: u32,
     pub height: u32,
+}
+
+impl<'a> Image<'a> {
+    fn sqrt(&self) -> Image<'a> {
+        Image {
+            data: self.data.iter().map(|v| v.sqrt()).collect::<Vec<f32>>().into(),
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+impl Mul<Image<'_>> for Image<'_> {
+    type Output = Image<'static>;
+
+    fn mul(self, rhs: Image<'_>) -> Self::Output {
+        let mut data = Vec::with_capacity(self.data.len());
+        for (a, b) in self.data.iter().zip(rhs.data.iter()) {
+            data.push(a * b);
+        }
+
+        Image {
+            data: Cow::Owned(data),
+            width: self.width,
+            height: self.height,
+        }
+    }
+
+}
+
+impl Mul<Image<'_>> for f32 {
+    type Output = Image<'static>;
+
+    fn mul(self, rhs: Image<'_>) -> Self::Output {
+        rhs * self
+    }
 }
 
 impl Mul<f32> for Image<'_> {
@@ -192,6 +238,14 @@ impl Mul<f32> for Image<'_> {
     }
 }
 
+impl Div<f32> for Image<'_> {
+    type Output = Image<'static>;
+
+    fn div(self, rhs: f32) -> Self::Output {
+        self * (1.0 / rhs)
+    }
+}
+
 impl<'a> Add for Image<'a> {
     type Output = Image<'a>;
 
@@ -199,6 +253,23 @@ impl<'a> Add for Image<'a> {
         let mut data = Vec::with_capacity(self.data.len());
         for (a, b) in self.data.iter().zip(other.data.iter()) {
             data.push(a + b);
+        }
+
+        Image {
+            data: Cow::Owned(data),
+            width: self.width,
+            height: self.height,
+        }
+    }
+}
+
+impl<'a> Sub for Image<'a> {
+    type Output = Image<'a>;
+
+    fn sub(self, other: Image<'a>) -> Self::Output {
+        let mut data = Vec::with_capacity(self.data.len());
+        for (a, b) in self.data.iter().zip(other.data.iter()) {
+            data.push(a - b);
         }
 
         Image {
